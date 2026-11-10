@@ -25,7 +25,7 @@ This version trades security for zero setup:
 - **The data is public to anyone who finds the storage address.** The trip is one JSON document on [textdb.dev](https://textdb.dev), a free service that needs no account. Its address is in [`js/config.js`](js/config.js), and this repository is public. **Don't store anything private,** such as passport numbers, phone numbers or home addresses.
 - **Roles are honor-system.** The planner passcode decides which buttons the page shows. Someone technical could change the data directly, and anyone can choose any name.
 - **The storage is a free hobby service with no guarantees.** Planners should use **Download backup** on the People tab after big changes. **Restore from backup** puts a saved copy back.
-- **Changes are last-write-wins.** Each change re-reads the latest data before saving, so collisions are rare. But if two people save at exactly the same moment, one change can be lost.
+- **Simultaneous changes are merged on a best-effort basis.** Each page saves one change at a time and re-reads the latest data first. Every save carries a revision id, so if someone else's save drops your change, your page notices (right after saving, or at the next check) and applies it again for up to a minute. The storage can't lock the data, so a change can still be lost if the page that made it is closed in the moment after someone overwrites it.
 
 If you later want real privacy and enforced permissions, the planner can be moved to a database with logins (for example, Supabase).
 
