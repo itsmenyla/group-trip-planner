@@ -37,6 +37,17 @@
     <p class="error" id="startError" hidden></p>
   </form>
 
+  <!-- Stored text exists but can't be read: never offer to start over here -->
+  <section class="panel narrow" id="damagedView" hidden>
+    <h2>The trip data couldn’t be read</h2>
+    <p class="note">Something is stored for this trip, but it isn’t valid trip data. Nothing has been changed. A planner can restore the latest backup file. You can also download the stored text so it isn’t lost.</p>
+    <div class="actions">
+      <button class="btn primary" type="button" data-act="restore">Restore from backup…</button>
+      <button class="btn" type="button" data-act="download-raw">Download stored text</button>
+      <button class="btn" type="button" data-act="reload">Try again</button>
+    </div>
+  </section>
+
   <!-- This device doesn't know who is using it yet -->
   <form class="panel narrow" id="whoView" hidden>
     <h2>Who are you?</h2>
