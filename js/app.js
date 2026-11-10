@@ -28,7 +28,7 @@
   let toastT;
   function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 3500); }
   function banner(msg) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; }
-  function show(view) { for (const id of ['startView', 'whoView', 'appView']) $('#' + id).hidden = id !== view; }
+  function show(view) { for (const id of ['startView', 'damagedView', 'whoView', 'appView']) $('#' + id).hidden = id !== view; }
   function fail(e) { console.error(e); toast(e && e.userMessage ? e.userMessage : 'Couldn’t save. Check your connection and try again.'); }
   async function hashPass(p) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('group-trip-planner:' + p));
@@ -147,7 +147,11 @@
       // A save started or finished while this request was in flight: its answer may be stale.
       if (S.saving || seq !== S.seq || text === S.raw) return;
       const doc = parseDoc(text);
-      if (!doc && text) { banner('The trip data looks damaged. A planner can restore a backup from the People tab.'); return; }
+      if (!doc && text) {
+        // Keep working from the copy already loaded (its People tab can restore); with none, show the recovery view.
+        if (S.doc) { banner('The stored trip data looks damaged. A planner can restore a backup from the People tab.'); return; }
+        S.raw = text; route(); return;
+      }
       const rel = doc && S.doc ? relation(doc, S.doc) : 'newer';
       if (rel === 'same' || rel === 'older') return;
       S.doc = doc; S.raw = text; S.seq++;
@@ -199,7 +203,8 @@
   /* ---------- routing ---------- */
   function route() {
     renderHeader();
-    if (!D()) { show('startView'); return; }
+    // No document: "Start your trip" only when nothing is stored; stored-but-unreadable text gets the recovery view.
+    if (!D()) { show(S.raw ? 'damagedView' : 'startView'); return; }
     if (!me()) { renderPicker(); show('whoView'); return; }
     show('appView');
     render();
@@ -211,7 +216,8 @@
     $('#tripName').textContent = (t && t.name) || 'Group Trip Planner';
     $('#tripDates').textContent = t ? fmtRange(t.start_date, t.end_date) : 'Group trip';
     const dest = $('#tripDest');
-    if (!D()) dest.textContent = 'Plan the trip together: one itinerary, everyone’s ideas, and who’s going to what.';
+    if (!D() && S.raw) dest.textContent = '';
+    else if (!D()) dest.textContent = 'Plan the trip together: one itinerary, everyone’s ideas, and who’s going to what.';
     else if (t.destination) dest.textContent = t.destination + (t.group_size ? ` · ${t.group_size} travellers` : '');
     else dest.textContent = isPlanner() ? 'Add the destination and dates with “Edit trip details”.' : 'The planning team hasn’t added trip details yet.';
     const m = D() && me();
@@ -471,8 +477,11 @@
   /* ---------- first visit, and choosing who you are ---------- */
   async function startTrip() {
     $('#startError').hidden = true;
-    const existing = parseDoc(await fetchRaw());
-    if (existing) { S.doc = existing; S.raw = JSON.stringify(existing); toast('Someone already started this trip.'); route(); return; }
+    const raw = await fetchRaw();
+    const existing = parseDoc(raw);
+    if (existing) { S.doc = existing; S.raw = raw; toast('Someone already started this trip.'); route(); return; }
+    // Never write a fresh trip over stored text we can't read: it may still be recoverable.
+    if (raw) { S.doc = null; S.raw = raw; toast('The stored trip data couldn’t be read, so nothing was changed.'); route(); return; }
     const doc = emptyDoc();
     const id = newId();
     doc.trip.name = val('startTrip').slice(0, 80);
@@ -545,6 +554,8 @@
         }
         case 'backup': return downloadBackup();
         case 'restore': return $('#restoreFile').click();
+        case 'download-raw': return downloadFile(S.raw, `trip-stored-text-${new Date().toISOString().slice(0, 10)}.txt`, 'text/plain');
+        case 'reload': return location.reload();
       }
       if (act === 'del-item') {
         if (!confirmTwice(b, 'i' + id)) return;
@@ -608,13 +619,15 @@
   });
 
   /* ---------- backups ---------- */
-  function downloadBackup() {
-    const blob = new Blob([JSON.stringify(D(), null, 2)], { type: 'application/json' });
+  function downloadFile(text, name, type) {
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `trip-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.href = URL.createObjectURL(new Blob([text], { type }));
+    a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  function downloadBackup() {
+    downloadFile(JSON.stringify(D(), null, 2), `trip-backup-${new Date().toISOString().slice(0, 10)}.json`, 'application/json');
   }
   $('#restoreFile').addEventListener('change', async (e) => {
     const file = e.target.files[0]; e.target.value = '';
@@ -622,7 +635,7 @@
     try {
       const doc = JSON.parse(await file.text());
       if (!validDoc(doc)) { toast('That file isn’t a trip backup.'); return; }
-      if (!doc.plannerHash) doc.plannerHash = D().plannerHash;
+      if (!doc.plannerHash && D()) doc.plannerHash = D().plannerHash;
       await enqueue(async () => {
         // Build on the current history so other pages see the restore as the newest copy.
         let cur = null; try { cur = parseDoc(await fetchRaw()); } catch (e2) { console.error(e2); }
@@ -643,7 +656,6 @@
     try {
       const text = await fetchRaw();
       S.raw = text; S.doc = parseDoc(text);
-      if (!S.doc && text) banner('The trip data looks damaged. A planner can restore a backup from the People tab.');
     } catch (e) {
       console.error(e);
       banner('Can’t reach the trip data. Check your connection and reload the page.');
