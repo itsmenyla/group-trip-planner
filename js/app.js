@@ -16,7 +16,7 @@
   const POLL_MS = 10000;
   const STORE = (window.TRIP_CONFIG || {}).storeUrl;
 
-  const S = { doc: null, raw: '', meId: null, myHash: null, tab: 'itinerary', openPeople: new Set(), form: null, pendingRender: false, busy: false };
+  const S = { doc: null, raw: '', meId: null, myHash: null, tab: 'itinerary', openPeople: new Set(), form: null, pendingRender: false, saving: 0, seq: 0 };
 
   /* ---------- local (this device) ---------- */
   const local = {
@@ -38,7 +38,7 @@
   /* ---------- storage ---------- */
   function emptyDoc() {
     return { v: 1, trip: { name: 'Our group trip', destination: null, start_date: null, end_date: null, group_size: 10 },
-      plannerHash: null, people: [], items: [], sugs: [], rsvps: [], votes: [], updated_at: null };
+      plannerHash: null, people: [], items: [], sugs: [], rsvps: [], votes: [], updated_at: null, rev: null, hist: [] };
   }
   function validDoc(d) {
     return d && d.v === 1 && d.trip && ['people', 'items', 'sugs', 'rsvps', 'votes'].every((k) => Array.isArray(d[k]));
@@ -62,37 +62,102 @@
     const body = JSON.stringify(doc);
     const res = await fetch(STORE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     if (!res.ok) throw new Error('Save failed: ' + res.status);
-    S.doc = doc; S.raw = body;
+    S.doc = doc; S.raw = body; S.seq++;
   }
-  // Read the latest copy, apply one change, save. Keeps the window for overwriting someone
-  // else's simultaneous change as small as possible (the store has no transactions).
-  async function mutate(change) {
-    S.busy = true;
-    try {
-      const latest = parseDoc(await fetchRaw());
-      if (!latest) throw Object.assign(new Error('missing'), { userMessage: 'The trip data couldn’t be read. Reload the page and try again.' });
-      change(latest);
-      latest.updated_at = new Date().toISOString();
-      await saveDoc(latest);
-    } finally {
-      S.busy = false;
+
+  // Revisions. The store has no transactions or conditional writes, so every save gets a new
+  // random `rev`, and `hist` lists the last HIST revs the document was built on (newest first).
+  // Comparing two copies then tells us whether one already contains the other, or whether
+  // someone saved over a copy that didn't include our change ("diverged").
+  const HIST = 50, REAPPLY_MS = 60000;
+  const histOf = (d) => (d && Array.isArray(d.hist) ? d.hist : []);
+  function stamp(doc) {
+    doc.updated_at = new Date().toISOString();
+    doc.rev = newId();
+    doc.hist = [doc.rev, ...histOf(doc)].slice(0, HIST);
+  }
+  // How copy `a` relates to copy `b`: 'same', 'newer' (a includes b), 'older' (b includes a) or 'diverged'.
+  function relation(a, b) {
+    if (!b) return 'newer';
+    if (a.rev && b.rev) {
+      if (a.rev === b.rev) return 'same';
+      if (histOf(a).includes(b.rev)) return 'newer';
+      if (histOf(b).includes(a.rev)) return 'older';
+      return 'diverged';
     }
-    route();
+    if (!b.rev && a.rev) return 'newer'; // b was saved before revisions existed
+    const ta = a.updated_at || '', tb = b.updated_at || '';
+    return ta === tb ? 'same' : ta > tb ? 'newer' : 'older';
   }
+
+  // All writes from this page run one at a time, so two quick clicks can't read the same
+  // copy and overwrite each other.
+  let queue = Promise.resolve();
+  function enqueue(task) {
+    const run = queue.then(async () => {
+      S.saving++;
+      try { return await task(); } finally { S.saving--; }
+    });
+    queue = run.catch(() => {});
+    return run;
+  }
+
+  // This device's recent changes. If someone else's save drops one of them, it is applied again.
+  // Changes must therefore be idempotent: they set a state ("I'm interested"), never toggle it.
+  const recent = [];
+  function lostChanges(doc) {
+    const now = Date.now();
+    while (recent.length && now - recent[0].at > REAPPLY_MS) recent.shift();
+    return recent.filter((r) => !histOf(doc).includes(r.rev));
+  }
+
+  // Read the latest copy, apply the change (plus any of ours that were lost), save, then read
+  // back to check nobody saved over it in the meantime; if they did, apply it again on top.
+  function mutate(change) {
+    return enqueue(async () => {
+      let text = await fetchRaw();
+      for (let attempt = 0; ; attempt++) {
+        const base = parseDoc(text);
+        if (!base) throw Object.assign(new Error('missing'), { userMessage: 'The trip data couldn’t be read. Reload the page and try again.' });
+        const lost = lostChanges(base);
+        for (const r of lost) r.change(base);
+        if (change) change(base);
+        stamp(base);
+        await saveDoc(base);
+        for (const r of lost) r.rev = base.rev;
+        if (change) { recent.push({ rev: base.rev, change, at: Date.now() }); change = null; }
+
+        let check = null;
+        try { text = await fetchRaw(); check = parseDoc(text); } catch (e) { console.error(e); }
+        if (!check) break;
+        const rel = relation(check, base);
+        if (rel === 'newer') { S.doc = check; S.raw = text; S.seq++; }
+        if (rel !== 'diverged' || attempt >= 2) break;
+      }
+      route();
+    });
+  }
+
   async function refresh() {
-    if (S.busy || document.visibilityState !== 'visible') return;
+    if (S.saving || document.visibilityState !== 'visible') return;
+    const seq = S.seq;
     try {
       const text = await fetchRaw();
       banner('');
-      if (text === S.raw) return;
+      // A save started or finished while this request was in flight: its answer may be stale.
+      if (S.saving || seq !== S.seq || text === S.raw) return;
       const doc = parseDoc(text);
       if (!doc && text) {
         // Keep working from the copy already loaded (its People tab can restore); with none, show the recovery view.
         if (S.doc) { banner('The stored trip data looks damaged. A planner can restore a backup from the People tab.'); return; }
         S.raw = text; route(); return;
       }
-      S.doc = doc; S.raw = text;
+      const rel = doc && S.doc ? relation(doc, S.doc) : 'newer';
+      if (rel === 'same' || rel === 'older') return;
+      S.doc = doc; S.raw = text; S.seq++;
       route();
+      // Someone saved over a copy without our latest change: put it back.
+      if (rel === 'diverged' && lostChanges(doc).length) mutate(null).catch(fail);
     } catch (e) {
       console.error(e);
       banner('Can’t reach the trip data right now. Changes from others will show up once the connection is back.');
@@ -368,10 +433,10 @@
         const row = { title: val('f-title').slice(0, 120), day: val('f-date') || null, start_time: val('f-time') || null, end_time: val('f-end') || null,
           location: clean(val('f-loc'), 160), link: safeUrl(val('f-link')) || null, notes: clean(val('f-notes'), 1000) };
         const { id, fromSug } = S.form;
+        const itemId = newId(), createdAt = new Date().toISOString();
         await mutate((d) => {
           if (id) { const it = d.items.find((x) => x.id === id); if (it) Object.assign(it, row); return; }
-          const itemId = newId();
-          d.items.push({ id: itemId, ...row, created_by: S.meId, created_at: new Date().toISOString() });
+          if (!d.items.some((x) => x.id === itemId)) d.items.push({ id: itemId, ...row, created_by: S.meId, created_at: createdAt });
           const s = fromSug && d.sugs.find((x) => x.id === fromSug); if (s) s.promoted_to = itemId;
         });
         toast(id ? 'Activity updated' : 'Added to the itinerary');
@@ -379,7 +444,7 @@
       } else if (kind === 'sug') {
         const row = { id: newId(), title: val('s-title').slice(0, 120), kind: val('s-kind'), location: clean(val('s-loc'), 160), link: safeUrl(val('s-link')) || null,
           why: clean(val('s-why'), 600), created_by: S.meId, created_at: new Date().toISOString(), promoted_to: null };
-        await mutate((d) => { d.sugs.push(row); });
+        await mutate((d) => { if (!d.sugs.some((x) => x.id === row.id)) d.sugs.push(row); });
         toast('Suggestion added'); closeForm();
       } else if (kind === 'trip') {
         const size = Number(val('t-size'));
@@ -422,8 +487,8 @@
     doc.trip.name = val('startTrip').slice(0, 80);
     doc.plannerHash = await hashPass(val('startPass'));
     doc.people.push({ id, name: val('startName').slice(0, 40), planner: true, joined_at: new Date().toISOString() });
-    doc.updated_at = new Date().toISOString();
-    await saveDoc(doc);
+    stamp(doc);
+    await enqueue(() => saveDoc(doc));
     S.meId = id; local.set('me', id);
     S.myHash = doc.plannerHash; local.set('plannerHash', S.myHash);
     route();
@@ -507,17 +572,21 @@
       } else if (act === 'rsvp') {
         b.disabled = true;
         const s = b.dataset.s;
+        const clear = (myAnswer(id) || {}).status === s; // clicking your current answer clears it
         await mutate((d) => {
+          if (!d.items.some((x) => x.id === id)) return; // deleted meanwhile
           const i = d.rsvps.findIndex((r) => r.item_id === id && r.user_id === S.meId);
-          if (i >= 0 && d.rsvps[i].status === s) d.rsvps.splice(i, 1);
+          if (clear) { if (i >= 0) d.rsvps.splice(i, 1); }
           else if (i >= 0) d.rsvps[i].status = s;
           else d.rsvps.push({ item_id: id, user_id: S.meId, status: s, note: null });
         });
       } else if (act === 'like') {
         b.disabled = true;
+        const want = !iLike(id);
         await mutate((d) => {
+          if (!d.sugs.some((x) => x.id === id)) return; // removed meanwhile
           const i = d.votes.findIndex((v) => v.suggestion_id === id && v.user_id === S.meId);
-          if (i >= 0) d.votes.splice(i, 1); else d.votes.push({ suggestion_id: id, user_id: S.meId });
+          if (!want && i >= 0) d.votes.splice(i, 1); else if (want && i < 0) d.votes.push({ suggestion_id: id, user_id: S.meId });
         });
       }
     } catch (err) {
@@ -566,8 +635,8 @@
     try {
       const doc = JSON.parse(await file.text());
       if (!validDoc(doc)) { toast('That file isn’t a trip backup.'); return; }
-      S.busy = true;
-      try {
+      // Queued like any other save, so the comparison and the write see the latest copy.
+      const restored = await enqueue(async () => {
         // Compare against the latest saved copy, not what this page last saw. If the stored
         // data is damaged, fall back to this page's copy; with neither (the recovery view),
         // there is nothing to keep and the backup is restored as it is.
@@ -582,14 +651,17 @@
             + (keep.length ? `\n\n${keep.length === 1 ? 'This person is' : 'These people are'} not in the backup and will be kept: ${keep.map((p) => p.name).join(', ')}.` : '')
             + (cur.plannerHash ? '\n\nThe current planner passcode stays the same.' : '')
           : `Restore the backup from ${when} (${n(doc)})?\n\nThe stored trip data can’t be read and will be replaced.`;
-        if (!confirm(msg)) return;
+        if (!confirm(msg)) return false;
         doc.people.push(...keep);
         if (cur && cur.plannerHash) doc.plannerHash = cur.plannerHash; // never bring back an old passcode
-        doc.updated_at = new Date().toISOString();
+        // Build on the current history so other pages see the restore as the newest copy.
+        doc.hist = histOf(cur);
+        stamp(doc);
         await saveDoc(doc);
-      } finally {
-        S.busy = false;
-      }
+        recent.length = 0; // don't re-apply older changes on top of the restored copy
+        return true;
+      });
+      if (!restored) return;
       toast('Backup restored'); route();
     } catch (err) { fail(err); }
   });
