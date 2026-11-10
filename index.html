@@ -20,39 +20,33 @@
     </div>
     <div class="who" id="whoChip" hidden>
       <div><b id="whoName"></b><span id="whoRole"></span></div>
-      <button class="btn small" id="signOut" type="button">Sign out</button>
+      <button class="btn small" id="switchPerson" type="button">Switch person</button>
     </div>
   </header>
 
   <div class="banner" id="banner" role="status" hidden></div>
 
-  <!-- Not configured yet -->
-  <section class="panel narrow" id="setupView" hidden>
-    <h2>Almost ready</h2>
-    <p>This site isn’t connected to its database yet. Add your Supabase project URL and key to <code>js/config.js</code>, as described in the README.</p>
-  </section>
-
-  <!-- Signed out -->
-  <form class="panel narrow" id="signInView" hidden>
-    <h2>Sign in</h2>
-    <p class="note">Enter your email and we’ll send you a sign-in link. No password needed.</p>
-    <label>Email<input id="signInEmail" type="email" autocomplete="email" required></label>
-    <div class="actions"><button class="btn primary" type="submit">Email me a sign-in link</button></div>
-    <p class="note" id="signInSent" hidden></p>
-    <p class="error" id="signInError" hidden></p>
+  <!-- First visit ever: nobody has set the trip up yet -->
+  <form class="panel narrow" id="startView" hidden>
+    <h2>Start your trip</h2>
+    <p class="note">You’ll be on the planning team. Choose a planner passcode and share it only with the other planners.</p>
+    <label>Trip name<input id="startTrip" maxlength="80" required placeholder="e.g. Penang 2027"></label>
+    <label>Your name<input id="startName" maxlength="40" autocomplete="name" required></label>
+    <label>Planner passcode<input id="startPass" type="password" minlength="4" maxlength="64" autocomplete="new-password" required></label>
+    <div class="actions"><button class="btn primary" type="submit">Start planning</button></div>
+    <p class="error" id="startError" hidden></p>
   </form>
 
-  <!-- Signed in, not part of the trip yet -->
-  <form class="panel narrow" id="joinView" hidden>
-    <h2>Join the trip</h2>
-    <p class="note">Ask a planner for the invite code. The code decides whether you join the planning team or as a suggester.</p>
-    <label>Your name<input id="joinName" maxlength="40" autocomplete="name" required></label>
-    <label>Invite code<input id="joinCode" autocomplete="off" required></label>
-    <div class="actions"><button class="btn primary" type="submit">Join</button></div>
-    <p class="error" id="joinError" hidden></p>
+  <!-- This device doesn't know who is using it yet -->
+  <form class="panel narrow" id="whoView" hidden>
+    <h2>Who are you?</h2>
+    <div id="pickList" class="actions"></div>
+    <label>Or add your name<input id="whoNew" maxlength="40" autocomplete="name"></label>
+    <label>Planner passcode <span style="font-weight:400">(planning team only)</span><input id="whoPass" type="password" maxlength="64" autocomplete="current-password"></label>
+    <div class="actions"><button class="btn primary" type="submit">Continue</button></div>
+    <p class="error" id="whoError" hidden></p>
   </form>
 
-  <!-- Member view -->
   <div id="appView" hidden>
     <div style="display:grid;gap:20px">
       <div id="tripFormSlot"></div>
@@ -69,8 +63,8 @@
   </div>
 </div>
 <div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="restoreFile" accept="application/json,.json" hidden>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script src="js/config.js"></script>
 <script src="js/app.js"></script>
 </body>

@@ -1,70 +1,121 @@
-// Group Trip Planner — static front end for GitHub Pages, backed by Supabase.
-// Permissions are enforced by the database (supabase/schema.sql); this page only hides
-// controls a person can't use and explains refusals.
+// Group Trip Planner — static site for GitHub Pages. No accounts, no setup.
+// All data is one JSON document on textdb.dev (see js/config.js). Roles are honour-system:
+// the planner passcode only decides which controls this page shows. Anyone with the
+// storage address could still change the data directly, so keep backups (People tab).
 (function () {
   'use strict';
 
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : ''; } catch { return ''; } };
-  const blankToNull = (v) => (v && v.trim() ? v.trim() : null);
+  const clean = (v, max) => (v && v.trim() ? v.trim().slice(0, max) : null);
+  const newId = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
   const STATUS = { going: 'Going', maybe: 'Maybe', no: 'Not going' };
   const KINDS = { activity: 'Activity', place: 'Place', food: 'Food & drink', stay: 'Stay', other: 'Other' };
   const TABS = ['itinerary', 'suggestions', 'interest', 'people'];
+  const POLL_MS = 10000;
+  const STORE = (window.TRIP_CONFIG || {}).storeUrl;
 
-  const S = {
-    session: null, uid: null, me: null,
-    trip: null, members: [], items: [], sugs: [], rsvps: [], votes: [], codes: null,
-    tab: 'itinerary', openPeople: new Set(), form: null, pendingRender: false, loaded: false,
+  const S = { doc: null, raw: '', meId: null, myHash: null, tab: 'itinerary', openPeople: new Set(), form: null, pendingRender: false, busy: false };
+
+  /* ---------- local (this device) ---------- */
+  const local = {
+    get(k) { try { return localStorage.getItem('trip.' + k); } catch { return null; } },
+    set(k, v) { try { v == null ? localStorage.removeItem('trip.' + k) : localStorage.setItem('trip.' + k, v); } catch { /* storage unavailable */ } },
   };
-  let sb = null;
 
   /* ---------- small helpers ---------- */
   let toastT;
-  function toast(msg) {
-    const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-    clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 3500);
-  }
+  function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 3500); }
   function banner(msg) { const b = $('#banner'); b.hidden = !msg; b.textContent = msg || ''; }
-  function show(view) {
-    for (const id of ['setupView', 'signInView', 'joinView', 'appView']) $('#' + id).hidden = id !== view;
+  function show(view) { for (const id of ['startView', 'whoView', 'appView']) $('#' + id).hidden = id !== view; }
+  function fail(e) { console.error(e); toast(e && e.userMessage ? e.userMessage : 'Couldn’t save. Check your connection and try again.'); }
+  async function hashPass(p) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('group-trip-planner:' + p));
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
   }
-  function friendlyError(e) {
-    const code = e && e.code;
-    if (code === '42501' || /row-level security|permission denied/i.test(e && e.message)) {
-      return "You don't have permission to do that. Ask a planner if you think you should.";
-    }
-    if (code === '23514') return 'Some of those details aren’t valid. Check the fields (links must start with http:// or https://).';
-    if (code === 'P0001') return e.message; // messages raised by our own database functions
-    if (e && /fetch|network/i.test(e.message)) return 'Couldn’t reach the trip database. Check your connection and try again.';
-    return (e && e.message) || 'Something went wrong. Try again.';
-  }
-  async function run(promise) {
-    const { data, error } = await promise;
-    if (error) throw error;
-    return data;
-  }
-  function fail(e) { console.error(e); toast(friendlyError(e)); }
 
-  const isPlanner = () => S.me && S.me.role === 'planner';
-  const nameOf = (uid) => { const m = S.members.find((x) => x.user_id === uid); return m ? m.display_name : 'Former member'; };
-  function dot(uid) {
-    let h = 0; for (const c of String(uid)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-    const initials = nameOf(uid).split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+  /* ---------- storage ---------- */
+  function emptyDoc() {
+    return { v: 1, trip: { name: 'Our group trip', destination: null, start_date: null, end_date: null, group_size: 10 },
+      plannerHash: null, people: [], items: [], sugs: [], rsvps: [], votes: [], updated_at: null };
+  }
+  function validDoc(d) {
+    return d && d.v === 1 && d.trip && ['people', 'items', 'sugs', 'rsvps', 'votes'].every((k) => Array.isArray(d[k]));
+  }
+  async function fetchRaw() {
+    // No "Accept: application/json" header: textdb.dev then returns the JSON wrapped in a string.
+    const res = await fetch(STORE, { cache: 'no-store' });
+    if (res.status === 404) return '';
+    if (!res.ok) throw new Error('Load failed: ' + res.status);
+    return (await res.text()).trim();
+  }
+  function parseDoc(text) {
+    if (!text) return null;
+    try {
+      let d = JSON.parse(text);
+      if (typeof d === 'string') d = JSON.parse(d); // tolerate a double-encoded copy
+      return validDoc(d) ? d : null;
+    } catch { return null; }
+  }
+  async function saveDoc(doc) {
+    const body = JSON.stringify(doc);
+    const res = await fetch(STORE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    if (!res.ok) throw new Error('Save failed: ' + res.status);
+    S.doc = doc; S.raw = body;
+  }
+  // Read the latest copy, apply one change, save. Keeps the window for overwriting someone
+  // else's simultaneous change as small as possible (the store has no transactions).
+  async function mutate(change) {
+    S.busy = true;
+    try {
+      const latest = parseDoc(await fetchRaw());
+      if (!latest) throw Object.assign(new Error('missing'), { userMessage: 'The trip data couldn’t be read. Reload the page and try again.' });
+      change(latest);
+      latest.updated_at = new Date().toISOString();
+      await saveDoc(latest);
+    } finally {
+      S.busy = false;
+    }
+    route();
+  }
+  async function refresh() {
+    if (S.busy || document.visibilityState !== 'visible') return;
+    try {
+      const text = await fetchRaw();
+      banner('');
+      if (text === S.raw) return;
+      const doc = parseDoc(text);
+      if (!doc && text) { banner('The trip data looks damaged. A planner can restore a backup from the People tab.'); return; }
+      S.doc = doc; S.raw = text;
+      route();
+    } catch (e) {
+      console.error(e);
+      banner('Can’t reach the trip data right now. Changes from others will show up once the connection is back.');
+    }
+  }
+
+  /* ---------- who is using this device ---------- */
+  const D = () => S.doc;
+  const me = () => (D() && D().people.find((p) => p.id === S.meId)) || null;
+  const isPlanner = () => !!(D() && D().plannerHash && S.myHash === D().plannerHash);
+  const nameOf = (id) => { const p = D().people.find((x) => x.id === id); return p ? p.name : 'Former member'; };
+  function dot(id) {
+    let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    const initials = nameOf(id).split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
     return `<span class="dot" aria-hidden="true" style="background:hsl(${h % 360} 45% 42%)">${esc(initials)}</span>`;
   }
 
   /* ---------- dates ---------- */
   const parseDay = (d) => (d ? new Date(d + 'T00:00:00') : null);
   const fmtDay = (d) => parseDay(d).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
-  const hhmm = (t) => (t ? String(t).slice(0, 5) : '');
   function fmtRange(a, b) {
     if (!a) return 'Group trip';
     const o = { day: 'numeric', month: 'short', year: 'numeric' };
     return b && b !== a ? `${parseDay(a).toLocaleDateString(undefined, o)} – ${parseDay(b).toLocaleDateString(undefined, o)}` : parseDay(a).toLocaleDateString(undefined, o);
   }
   function dayNumber(d) {
-    const s = S.trip && S.trip.start_date; if (!s || !d) return null;
+    const s = D().trip.start_date; if (!s || !d) return null;
     const n = Math.round((parseDay(d) - parseDay(s)) / 864e5) + 1;
     return n >= 1 ? n : null;
   }
@@ -72,82 +123,54 @@
   /* ---------- derived data ---------- */
   const answersFor = (itemId) => {
     const order = { going: 0, maybe: 1, no: 2 };
-    return S.rsvps.filter((r) => r.item_id === itemId).sort((a, b) => order[a.status] - order[b.status]);
+    return D().rsvps.filter((r) => r.item_id === itemId && STATUS[r.status]).sort((a, b) => order[a.status] - order[b.status]);
   };
-  const myAnswer = (itemId) => S.rsvps.find((r) => r.item_id === itemId && r.user_id === S.uid) || null;
-  const likesFor = (sid) => S.votes.filter((v) => v.suggestion_id === sid).length;
-  const iLike = (sid) => S.votes.some((v) => v.suggestion_id === sid && v.user_id === S.uid);
-  const sortedItems = () => [...S.items].sort((a, b) =>
+  const myAnswer = (itemId) => D().rsvps.find((r) => r.item_id === itemId && r.user_id === S.meId) || null;
+  const likesFor = (sid) => D().votes.filter((v) => v.suggestion_id === sid).length;
+  const iLike = (sid) => D().votes.some((v) => v.suggestion_id === sid && v.user_id === S.meId);
+  const sortedItems = () => [...D().items].sort((a, b) =>
     (a.day || '9999').localeCompare(b.day || '9999') || (a.start_time || '99').localeCompare(b.start_time || '99') || a.title.localeCompare(b.title));
 
-  /* ---------- loading ---------- */
-  async function loadAll() {
-    try {
-      const [trip, members, items, sugs, rsvps, votes] = await Promise.all([
-        run(sb.from('trip').select('*').eq('id', 1).maybeSingle()),
-        run(sb.from('members').select('*').order('display_name')),
-        run(sb.from('itinerary').select('*')),
-        run(sb.from('suggestions').select('*')),
-        run(sb.from('rsvps').select('*')),
-        run(sb.from('suggestion_votes').select('*')),
-      ]);
-      Object.assign(S, { trip, members, items, sugs, rsvps, votes, loaded: true });
-      S.me = members.find((m) => m.user_id === S.uid) || null;
-      banner('');
-      return true;
-    } catch (e) {
-      console.error(e);
-      banner('Couldn’t load the trip. Check your connection, then reload the page.');
-      return false;
-    }
-  }
-  let reloadT;
-  function scheduleReload() { clearTimeout(reloadT); reloadT = setTimeout(async () => { await loadAll(); route(); }, 250); }
-  let channel = null;
-  function subscribe() {
-    if (channel) return;
-    channel = sb.channel('trip-changes')
-      .on('postgres_changes', { event: '*', schema: 'public' }, scheduleReload)
-      .subscribe();
-  }
-
-  /* ---------- routing between sign-in, join and the app ---------- */
-  async function route() {
-    if (!S.session) { show('signInView'); $('#whoChip').hidden = true; renderHeader(); return; }
-    if (!S.loaded) await loadAll();
-    if (!S.me) { show('joinView'); renderHeader(); return; }
+  /* ---------- routing ---------- */
+  function route() {
+    renderHeader();
+    if (!D()) { show('startView'); return; }
+    if (!me()) { renderPicker(); show('whoView'); return; }
     show('appView');
-    subscribe();
     render();
   }
 
   /* ---------- rendering ---------- */
   function renderHeader() {
-    const t = S.trip;
+    const t = D() && D().trip;
     $('#tripName').textContent = (t && t.name) || 'Group Trip Planner';
     $('#tripDates').textContent = t ? fmtRange(t.start_date, t.end_date) : 'Group trip';
     const dest = $('#tripDest');
-    if (!S.session) dest.textContent = 'Plan the trip together: one itinerary, everyone’s ideas, and who’s going to what.';
-    else if (!S.me) dest.textContent = 'You’re signed in. Join the trip to see the plan.';
-    else if (t && t.destination) dest.textContent = t.destination + (t.group_size ? ` · ${t.group_size} travellers` : '');
+    if (!D()) dest.textContent = 'Plan the trip together: one itinerary, everyone’s ideas, and who’s going to what.';
+    else if (t.destination) dest.textContent = t.destination + (t.group_size ? ` · ${t.group_size} travellers` : '');
     else dest.textContent = isPlanner() ? 'Add the destination and dates with “Edit trip details”.' : 'The planning team hasn’t added trip details yet.';
+    const m = D() && me();
+    $('#whoChip').hidden = !m;
+    if (m) { $('#whoName').textContent = m.name; $('#whoRole').textContent = isPlanner() ? 'Planning team' : 'Suggester'; }
+  }
 
-    const chip = $('#whoChip');
-    chip.hidden = !S.session;
-    $('#whoName').textContent = S.me ? S.me.display_name : (S.session && S.session.user.email) || '';
-    $('#whoRole').textContent = S.me ? (isPlanner() ? 'Planning team' : 'Suggester') : 'Not joined yet';
+  function renderPicker() {
+    const people = [...D().people].sort((a, b) => a.name.localeCompare(b.name));
+    $('#pickList').innerHTML = people.length
+      ? '<p class="note" style="width:100%">Pick your name:</p>' + people.map((p) => `<button type="button" class="btn" data-act="pick" data-id="${esc(p.id)}">${esc(p.name)}</button>`).join('')
+      : '<p class="note">Nobody else has joined yet. Add your name below.</p>';
   }
 
   function renderChrome() {
-    $('#cItin').textContent = S.items.length || '';
-    $('#cSug').textContent = S.sugs.length || '';
-    $('#cPeople').textContent = S.members.length || '';
+    $('#cItin').textContent = D().items.length || '';
+    $('#cSug').textContent = D().sugs.length || '';
+    $('#cPeople').textContent = D().people.length || '';
     const r = isPlanner() ? 'planner' : 'member';
     const notes = {
       itinerary: { planner: 'You’re on the planning team: you can add, edit and remove itinerary activities.', member: 'Only the planning team changes the itinerary. Tell them if you’re going to each activity, or add ideas under Suggestions.' },
       suggestions: { planner: 'Anyone in the group can suggest ideas. Use “Add to itinerary” to move one into the plan.', member: 'Add places or activities you’d like to do. You can remove your own suggestions; the planning team can move them into the itinerary.' },
       interest: { planner: 'Everyone’s answers for every activity, so you can see headcounts and who hasn’t replied.', member: 'Everyone’s answers for every activity. Change yours on the Itinerary tab.' },
-      people: { planner: 'Share an invite code to bring people in. The planner code makes someone part of the planning team.', member: 'Everyone on the trip. Planners can change roles.' },
+      people: { planner: 'Everyone who has joined. Keep a backup now and then: the free storage has no guarantees.', member: 'Everyone who has joined. Planners can unlock planning tools here with the passcode.' },
     };
     $('#roleNote').textContent = notes[S.tab][r];
     const slot = $('#tripFormSlot');
@@ -169,7 +192,7 @@
     const link = safeUrl(it.link);
     const open = S.openPeople.has(it.id);
     return `<article class="item">
-      <div class="time">${esc(hhmm(it.start_time) || '—')}${it.end_time ? `<small>to ${esc(hhmm(it.end_time))}</small>` : ''}</div>
+      <div class="time">${esc(it.start_time || '—')}${it.end_time ? `<small>to ${esc(it.end_time)}</small>` : ''}</div>
       <div class="body">
         <div class="bar"><h3>${esc(it.title)}</h3>${isPlanner() ? `<div class="tools"><button type="button" class="btn small" data-act="edit-item" data-id="${esc(it.id)}">Edit</button><button type="button" class="btn small danger" data-act="del-item" data-id="${esc(it.id)}">Delete</button></div>` : ''}</div>
         ${it.location || link ? `<p class="meta">${esc(it.location)}${it.location && link ? ' · ' : ''}${link ? `<a href="${esc(link)}" target="_blank" rel="noopener">Link</a>` : ''}</p>` : ''}
@@ -198,12 +221,12 @@
 
   function renderSuggestions() {
     let h = !S.form ? '<div class="bar"><span></span><button type="button" class="btn primary" data-act="new-sug">Suggest something</button></div>' : '';
-    if (!S.sugs.length) return h + '<div class="empty"><h3>No suggestions yet</h3><p>Add a place, food spot or activity you’d like the group to consider.</p></div>';
-    const list = [...S.sugs].sort((a, b) => likesFor(b.id) - likesFor(a.id) || b.created_at.localeCompare(a.created_at));
+    if (!D().sugs.length) return h + '<div class="empty"><h3>No suggestions yet</h3><p>Add a place, food spot or activity you’d like the group to consider.</p></div>';
+    const list = [...D().sugs].sort((a, b) => likesFor(b.id) - likesFor(a.id) || (b.created_at || '').localeCompare(a.created_at || ''));
     return h + '<div class="sgrid">' + list.map((s) => {
       const link = safeUrl(s.link);
-      const canDel = s.created_by === S.uid || isPlanner();
-      const onItin = s.promoted_to && S.items.some((i) => i.id === s.promoted_to);
+      const canDel = s.created_by === S.meId || isPlanner();
+      const onItin = s.promoted_to && D().items.some((i) => i.id === s.promoted_to);
       return `<article class="sug"><span class="kind">${esc(KINDS[s.kind] || 'Other')}</span><h3>${esc(s.title)}</h3>
         ${s.location || link ? `<p class="meta">${esc(s.location)}${s.location && link ? ' · ' : ''}${link ? `<a href="${esc(link)}" target="_blank" rel="noopener">Link</a>` : ''}</p>` : ''}
         ${s.why ? `<p class="notes">${esc(s.why)}</p>` : ''}
@@ -218,9 +241,9 @@
   function renderInterest() {
     const items = sortedItems();
     if (!items.length) return '<div class="empty"><h3>Nothing to track yet</h3><p>Once the itinerary has activities, everyone’s answers show up here.</p></div>';
-    const people = [...S.members].sort((a, b) => (b.user_id === S.uid) - (a.user_id === S.uid) || a.display_name.localeCompare(b.display_name));
-    const replied = new Set(S.rsvps.map((r) => r.user_id));
-    const size = (S.trip && S.trip.group_size) || 0;
+    const people = [...D().people].sort((a, b) => (b.id === S.meId) - (a.id === S.meId) || a.name.localeCompare(b.name));
+    const replied = new Set(D().rsvps.filter((r) => items.some((i) => i.id === r.item_id)).map((r) => r.user_id));
+    const size = D().trip.group_size || 0;
     const goingTotals = items.map((it) => answersFor(it.id).filter((a) => a.status === 'going').length);
     const avg = goingTotals.reduce((x, y) => x + y, 0) / items.length;
     const best = Math.max(...goingTotals);
@@ -232,9 +255,9 @@
       <div class="stat"><b>${best}</b><span>going to ${esc(top.title)}</span></div></div>`;
     h += `<div class="gridwrap"><table><thead><tr><th class="name">Person</th>${items.map((it) => `<th class="act" title="${esc(it.title)}"><small>${it.day ? esc(fmtDay(it.day)) : 'TBD'}</small>${esc(it.title.length > 28 ? it.title.slice(0, 27) + '…' : it.title)}</th>`).join('')}</tr></thead><tbody>`;
     for (const p of people) {
-      h += `<tr><td class="name"><div class="person">${dot(p.user_id)}<b>${esc(p.display_name)}</b></div></td>`;
+      h += `<tr><td class="name"><div class="person">${dot(p.id)}<b>${esc(p.name)}</b></div></td>`;
       for (const it of items) {
-        const a = S.rsvps.find((r) => r.item_id === it.id && r.user_id === p.user_id);
+        const a = D().rsvps.find((r) => r.item_id === it.id && r.user_id === p.id && STATUS[r.status]);
         h += a ? `<td class="c" title="${esc(STATUS[a.status] + (a.note ? ': ' + a.note : ''))}"><span class="pill ${a.status}">${glyph[a.status]}</span></td>` : '<td class="c" title="No answer"><span class="pill none">–</span></td>';
       }
       h += '</tr>';
@@ -247,24 +270,18 @@
   function renderPeople() {
     let h = '';
     if (isPlanner()) {
-      if (S.codes) {
-        h += `<div class="panel"><h2>Invite codes</h2><p class="note">Send people this page’s link and the right code. They sign in with their email, then enter the code.</p>
-          ${S.codes.map((c) => `<div class="actions"><b style="min-width:110px">${c.role === 'planner' ? 'Planning team' : 'Suggesters'}</b><span class="code">${esc(c.code)}</span><button type="button" class="btn small" data-act="copy" data-code="${esc(c.code)}">Copy</button></div>`).join('')}</div>`;
-      } else {
-        h += '<div class="actions"><button type="button" class="btn" data-act="show-codes">Show invite codes</button></div>';
-      }
+      h += `<div class="panel"><h2>Planning tools</h2>
+        <p class="note">The trip is stored on a free service with no guarantees. Download a backup after big changes, and restore it if anything goes missing.</p>
+        <div class="actions"><button type="button" class="btn" data-act="backup">Download backup</button><button type="button" class="btn" data-act="restore">Restore from backup…</button><button type="button" class="btn" data-act="change-pass">Change planner passcode</button></div></div>`;
+    } else if (!S.form) {
+      h += '<div class="actions"><button type="button" class="btn" data-act="unlock">I’m on the planning team</button></div>';
     }
-    h += '<div class="mlist">' + S.members.map((m) => {
-      const self = m.user_id === S.uid;
+    h += '<div class="mlist">' + [...D().people].sort((a, b) => a.name.localeCompare(b.name)).map((p) => {
+      const self = p.id === S.meId;
       const tools = [];
       if (self) tools.push('<button type="button" class="btn small" data-act="rename">Change my name</button>');
-      if (isPlanner() && !self) {
-        tools.push(m.role === 'planner'
-          ? `<button type="button" class="btn small" data-act="set-role" data-id="${esc(m.user_id)}" data-role="member">Make suggester</button>`
-          : `<button type="button" class="btn small" data-act="set-role" data-id="${esc(m.user_id)}" data-role="planner">Make planner</button>`);
-        tools.push(`<button type="button" class="btn small danger" data-act="remove-member" data-id="${esc(m.user_id)}">Remove</button>`);
-      }
-      return `<div class="mrow"><div class="person">${dot(m.user_id)}<b>${esc(m.display_name)}${self ? ' (you)' : ''}</b><span class="role ${m.role}">${m.role === 'planner' ? 'Planning team' : 'Suggester'}</span></div><div class="tools">${tools.join('')}</div></div>`;
+      if (isPlanner() && !self) tools.push(`<button type="button" class="btn small danger" data-act="remove-person" data-id="${esc(p.id)}">Remove</button>`);
+      return `<div class="mrow"><div class="person">${dot(p.id)}<b>${esc(p.name)}${self ? ' (you)' : ''}</b>${p.planner ? '<span class="role planner">Planning team</span>' : ''}</div><div class="tools">${tools.join('')}</div></div>`;
     }).join('') + '</div>';
     return h;
   }
@@ -285,13 +302,13 @@
   function openItemForm(it, fromSug) {
     S.form = { kind: 'item', id: it && it.id, fromSug };
     const v = it || {};
-    const t = S.trip || {};
+    const t = D().trip;
     $('#formSlot').innerHTML = `<form class="panel" data-form="item"><h2>${v.id ? 'Edit activity' : 'Add activity'}</h2>
       <div class="fields">
         <label class="wide">Activity<input id="f-title" required maxlength="120" value="${esc(v.title)}" placeholder="e.g. Sunrise hike up the ridge"></label>
         <label>Date<input id="f-date" type="date" value="${esc(v.day)}" min="${esc(t.start_date)}" max="${esc(t.end_date)}"></label>
-        <label>Start time<input id="f-time" type="time" value="${esc(hhmm(v.start_time))}"></label>
-        <label>End time<input id="f-end" type="time" value="${esc(hhmm(v.end_time))}"></label>
+        <label>Start time<input id="f-time" type="time" value="${esc(v.start_time)}"></label>
+        <label>End time<input id="f-end" type="time" value="${esc(v.end_time)}"></label>
         <label class="wide">Where<input id="f-loc" maxlength="160" value="${esc(v.location)}" placeholder="Meeting point or address"></label>
         <label class="wide">Link<input id="f-link" type="url" maxlength="500" value="${esc(v.link)}" placeholder="https://"></label>
         <label class="wide">Notes<textarea id="f-notes" maxlength="1000" placeholder="Cost, what to bring, booking details">${esc(v.notes)}</textarea></label>
@@ -313,7 +330,7 @@
     render(); $('#s-title').focus();
   }
   function openTripForm() {
-    const t = S.trip || {};
+    const t = D().trip;
     $('#tripFormSlot').innerHTML = `<form class="panel" data-form="trip"><h2>Trip details</h2>
       <div class="fields">
         <label class="wide">Trip name<input id="t-name" maxlength="80" required value="${esc(t.name)}"></label>
@@ -325,12 +342,11 @@
       <div class="actions"><button class="btn primary" type="submit">Save trip details</button><button class="btn" type="button" data-act="cancel-trip">Cancel</button></div></form>`;
     $('#t-name').focus();
   }
-  function openRenameForm() {
-    S.form = { kind: 'rename' };
-    $('#formSlot').innerHTML = `<form class="panel narrow" data-form="rename"><h2>Change your name</h2>
-      <label>Name<input id="r-name" maxlength="40" required value="${esc(S.me.display_name)}"></label>
+  function openSmallForm(kind, title, field) {
+    S.form = { kind };
+    $('#formSlot').innerHTML = `<form class="panel narrow" data-form="${kind}"><h2>${title}</h2>${field}
       <div class="actions"><button class="btn primary" type="submit">Save</button><button class="btn" type="button" data-act="cancel">Cancel</button></div></form>`;
-    $('#r-name').focus();
+    render(); $('#formSlot input').focus();
   }
   function closeForm() { S.form = null; $('#formSlot').innerHTML = ''; render(); }
 
@@ -339,43 +355,96 @@
     e.preventDefault();
     const btn = f.querySelector('[type=submit]'); if (btn) btn.disabled = true;
     try {
-      if (f.id === 'signInView') return await signIn();
-      if (f.id === 'joinView') return await join();
+      if (f.id === 'startView') return await startTrip();
+      if (f.id === 'whoView') return await identify();
       const kind = f.dataset.form;
       if (kind === 'item') {
-        const row = { title: val('f-title'), day: val('f-date') || null, start_time: val('f-time') || null, end_time: val('f-end') || null,
-          location: blankToNull(val('f-loc')), link: blankToNull(val('f-link')), notes: blankToNull(val('f-notes')), updated_at: new Date().toISOString() };
-        if (S.form.id) {
-          await run(sb.from('itinerary').update(row).eq('id', S.form.id));
-          toast('Activity updated');
-        } else {
-          const created = await run(sb.from('itinerary').insert(row).select('id').single());
-          if (S.form.fromSug) await run(sb.from('suggestions').update({ promoted_to: created.id }).eq('id', S.form.fromSug));
-          toast('Added to the itinerary');
-        }
-        S.form = null; $('#formSlot').innerHTML = '';
+        const row = { title: val('f-title').slice(0, 120), day: val('f-date') || null, start_time: val('f-time') || null, end_time: val('f-end') || null,
+          location: clean(val('f-loc'), 160), link: safeUrl(val('f-link')) || null, notes: clean(val('f-notes'), 1000) };
+        const { id, fromSug } = S.form;
+        await mutate((d) => {
+          if (id) { const it = d.items.find((x) => x.id === id); if (it) Object.assign(it, row); return; }
+          const itemId = newId();
+          d.items.push({ id: itemId, ...row, created_by: S.meId, created_at: new Date().toISOString() });
+          const s = fromSug && d.sugs.find((x) => x.id === fromSug); if (s) s.promoted_to = itemId;
+        });
+        toast(id ? 'Activity updated' : 'Added to the itinerary');
+        closeForm();
       } else if (kind === 'sug') {
-        await run(sb.from('suggestions').insert({ title: val('s-title'), kind: val('s-kind'), location: blankToNull(val('s-loc')), link: blankToNull(val('s-link')), why: blankToNull(val('s-why')) }));
-        toast('Suggestion added');
-        S.form = null; $('#formSlot').innerHTML = '';
+        const row = { id: newId(), title: val('s-title').slice(0, 120), kind: val('s-kind'), location: clean(val('s-loc'), 160), link: safeUrl(val('s-link')) || null,
+          why: clean(val('s-why'), 600), created_by: S.meId, created_at: new Date().toISOString(), promoted_to: null };
+        await mutate((d) => { d.sugs.push(row); });
+        toast('Suggestion added'); closeForm();
       } else if (kind === 'trip') {
         const size = Number(val('t-size'));
-        await run(sb.from('trip').update({ name: val('t-name'), destination: blankToNull(val('t-dest')), start_date: val('t-start') || null,
-          end_date: val('t-end') || null, group_size: size >= 1 ? size : null, updated_at: new Date().toISOString() }).eq('id', 1));
-        $('#tripFormSlot').innerHTML = '';
-        toast('Trip details saved');
+        const trip = { name: val('t-name').slice(0, 80), destination: clean(val('t-dest'), 120), start_date: val('t-start') || null, end_date: val('t-end') || null, group_size: size >= 1 ? size : null };
+        await mutate((d) => { d.trip = trip; });
+        $('#tripFormSlot').innerHTML = ''; toast('Trip details saved'); render();
       } else if (kind === 'rename') {
-        await run(sb.from('members').update({ display_name: val('r-name') }).eq('user_id', S.uid));
-        toast('Name updated');
-        S.form = null; $('#formSlot').innerHTML = '';
+        const name = val('r-name').slice(0, 40);
+        await mutate((d) => { const p = d.people.find((x) => x.id === S.meId); if (p) p.name = name; });
+        toast('Name updated'); closeForm();
+      } else if (kind === 'unlock') {
+        const h = await hashPass(val('u-pass'));
+        if (h !== D().plannerHash) { toast('That passcode isn’t right.'); return; }
+        S.myHash = h; local.set('plannerHash', h);
+        await mutate((d) => { const p = d.people.find((x) => x.id === S.meId); if (p) p.planner = true; });
+        toast('Planning tools unlocked'); closeForm();
+      } else if (kind === 'change-pass') {
+        const h = await hashPass(val('c-pass'));
+        await mutate((d) => { d.plannerHash = h; });
+        S.myHash = h; local.set('plannerHash', h);
+        toast('Passcode changed. Tell the other planners the new one.'); closeForm();
       }
-      await loadAll(); render();
     } catch (err) {
       fail(err);
     } finally {
       if (btn && document.body.contains(btn)) btn.disabled = false;
     }
   });
+
+  /* ---------- first visit, and choosing who you are ---------- */
+  async function startTrip() {
+    $('#startError').hidden = true;
+    const existing = parseDoc(await fetchRaw());
+    if (existing) { S.doc = existing; S.raw = JSON.stringify(existing); toast('Someone already started this trip.'); route(); return; }
+    const doc = emptyDoc();
+    const id = newId();
+    doc.trip.name = val('startTrip').slice(0, 80);
+    doc.plannerHash = await hashPass(val('startPass'));
+    doc.people.push({ id, name: val('startName').slice(0, 40), planner: true, joined_at: new Date().toISOString() });
+    doc.updated_at = new Date().toISOString();
+    await saveDoc(doc);
+    S.meId = id; local.set('me', id);
+    S.myHash = doc.plannerHash; local.set('plannerHash', S.myHash);
+    route();
+    toast('Trip created. Share this page’s link with the group.');
+  }
+  async function identify(pickedId) {
+    $('#whoError').hidden = true;
+    const pass = val('whoPass');
+    const newName = val('whoNew').slice(0, 40);
+    let hash = null;
+    if (pass) {
+      hash = await hashPass(pass);
+      if (hash !== D().plannerHash) { $('#whoError').textContent = 'That planner passcode isn’t right. Leave it empty to join as a suggester.'; $('#whoError').hidden = false; return; }
+    }
+    let id = pickedId;
+    if (!id) {
+      if (!newName) { $('#whoError').textContent = 'Pick your name or type it in.'; $('#whoError').hidden = false; return; }
+      const same = D().people.find((p) => p.name.toLowerCase() === newName.toLowerCase());
+      id = same ? same.id : newId();
+    }
+    await mutate((d) => {
+      let p = d.people.find((x) => x.id === id);
+      if (!p) { p = { id, name: newName, planner: false, joined_at: new Date().toISOString() }; d.people.push(p); }
+      if (hash) p.planner = true;
+    });
+    S.meId = id; local.set('me', id);
+    S.myHash = hash; local.set('plannerHash', hash);
+    $('#whoPass').value = ''; $('#whoNew').value = '';
+    route();
+  }
 
   /* ---------- clicks ---------- */
   const armed = new Set();
@@ -386,16 +455,6 @@
     return false;
   }
 
-  async function setRsvp(itemId, status) {
-    const mine = myAnswer(itemId);
-    if (mine && mine.status === status) {
-      await run(sb.from('rsvps').delete().eq('item_id', itemId).eq('user_id', S.uid));
-    } else {
-      await run(sb.from('rsvps').upsert({ item_id: itemId, user_id: S.uid, status, note: mine ? mine.note : null, updated_at: new Date().toISOString() },
-        { onConflict: 'item_id,user_id' }));
-    }
-  }
-
   document.addEventListener('click', async (e) => {
     const tab = e.target.closest('.tabs button');
     if (tab) { setTab(tab.dataset.tab); return; }
@@ -403,38 +462,53 @@
     const { act, id } = b.dataset;
     try {
       switch (act) {
+        case 'pick': b.disabled = true; return await identify(id);
         case 'new-item': return openItemForm(null);
-        case 'edit-item': return openItemForm(S.items.find((i) => i.id === id));
+        case 'edit-item': return openItemForm(D().items.find((i) => i.id === id));
         case 'new-sug': return openSugForm();
         case 'cancel': return closeForm();
         case 'edit-trip': return openTripForm();
         case 'cancel-trip': $('#tripFormSlot').innerHTML = ''; return renderChrome();
-        case 'rename': return openRenameForm();
+        case 'rename': return openSmallForm('rename', 'Change your name', `<label>Name<input id="r-name" maxlength="40" required value="${esc(me().name)}"></label>`);
+        case 'unlock': return openSmallForm('unlock', 'Unlock planning tools', '<label>Planner passcode<input id="u-pass" type="password" required autocomplete="current-password"></label>');
+        case 'change-pass': return openSmallForm('change-pass', 'Change planner passcode', '<label>New passcode<input id="c-pass" type="password" minlength="4" required autocomplete="new-password"></label>');
         case 'people': S.openPeople.has(id) ? S.openPeople.delete(id) : S.openPeople.add(id); return render();
         case 'promote': {
-          const s = S.sugs.find((x) => x.id === id); if (!s) return;
+          const s = D().sugs.find((x) => x.id === id); if (!s) return;
           setTab('itinerary');
           return openItemForm({ title: s.title, location: s.location, link: s.link, notes: s.why }, s.id);
         }
-        case 'copy': {
-          try { await navigator.clipboard.writeText(b.dataset.code); toast('Code copied'); } catch { toast('Select the code and copy it'); }
-          return;
-        }
-        case 'show-codes': S.codes = await run(sb.rpc('planner_invite_codes')); return render();
+        case 'backup': return downloadBackup();
+        case 'restore': return $('#restoreFile').click();
       }
-      // Everything below writes to the database.
-      if (act === 'del-item') { if (!confirmTwice(b, 'i' + id)) return; await run(sb.from('itinerary').delete().eq('id', id)); toast('Activity deleted'); }
-      else if (act === 'del-sug') { if (!confirmTwice(b, 's' + id)) return; await run(sb.from('suggestions').delete().eq('id', id)); toast('Suggestion removed'); }
-      else if (act === 'remove-member') { if (!confirmTwice(b, 'm' + id)) return; await run(sb.from('members').delete().eq('user_id', id)); toast('Removed from the trip'); }
-      else if (act === 'set-role') { await run(sb.rpc('set_member_role', { target: id, new_role: b.dataset.role })); toast('Role updated'); }
-      else if (act === 'rsvp') { b.disabled = true; await setRsvp(id, b.dataset.s); }
-      else if (act === 'like') {
+      if (act === 'del-item') {
+        if (!confirmTwice(b, 'i' + id)) return;
+        await mutate((d) => { d.items = d.items.filter((x) => x.id !== id); d.rsvps = d.rsvps.filter((r) => r.item_id !== id); });
+        toast('Activity deleted');
+      } else if (act === 'del-sug') {
+        if (!confirmTwice(b, 's' + id)) return;
+        await mutate((d) => { d.sugs = d.sugs.filter((x) => x.id !== id); d.votes = d.votes.filter((v) => v.suggestion_id !== id); });
+        toast('Suggestion removed');
+      } else if (act === 'remove-person') {
+        if (!confirmTwice(b, 'p' + id)) return;
+        await mutate((d) => { d.people = d.people.filter((x) => x.id !== id); d.rsvps = d.rsvps.filter((r) => r.user_id !== id); d.votes = d.votes.filter((v) => v.user_id !== id); });
+        toast('Removed from the trip');
+      } else if (act === 'rsvp') {
         b.disabled = true;
-        if (iLike(id)) await run(sb.from('suggestion_votes').delete().eq('suggestion_id', id).eq('user_id', S.uid));
-        else await run(sb.from('suggestion_votes').insert({ suggestion_id: id, user_id: S.uid }));
+        const s = b.dataset.s;
+        await mutate((d) => {
+          const i = d.rsvps.findIndex((r) => r.item_id === id && r.user_id === S.meId);
+          if (i >= 0 && d.rsvps[i].status === s) d.rsvps.splice(i, 1);
+          else if (i >= 0) d.rsvps[i].status = s;
+          else d.rsvps.push({ item_id: id, user_id: S.meId, status: s, note: null });
+        });
+      } else if (act === 'like') {
+        b.disabled = true;
+        await mutate((d) => {
+          const i = d.votes.findIndex((v) => v.suggestion_id === id && v.user_id === S.meId);
+          if (i >= 0) d.votes.splice(i, 1); else d.votes.push({ suggestion_id: id, user_id: S.meId });
+        });
       }
-      else return;
-      await loadAll(); render();
     } catch (err) {
       fail(err);
       if (document.body.contains(b)) b.disabled = false;
@@ -444,77 +518,66 @@
   async function commitNote(input) {
     const id = input.dataset.note, note = input.value.trim().slice(0, 140);
     const mine = myAnswer(id); if (!mine || (mine.note || '') === note) return;
-    try {
-      await run(sb.from('rsvps').update({ note: note || null, updated_at: new Date().toISOString() }).eq('item_id', id).eq('user_id', S.uid));
-      await loadAll(); render();
-    } catch (err) { fail(err); }
+    try { await mutate((d) => { const r = d.rsvps.find((x) => x.item_id === id && x.user_id === S.meId); if (r) r.note = note || null; }); }
+    catch (err) { fail(err); }
   }
   document.addEventListener('change', (e) => { if (e.target.matches('input[data-note]')) commitNote(e.target); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('input[data-note]')) { e.preventDefault(); e.target.blur(); } });
 
   function setTab(t) {
     if (!TABS.includes(t)) t = 'itinerary';
-    S.tab = t;
-    try { localStorage.setItem('trip.tab', t); } catch { /* storage unavailable */ }
+    S.tab = t; local.set('tab', t);
     const keep = S.form && ((S.form.kind === 'item' && t === 'itinerary') || (S.form.kind === 'sug' && t === 'suggestions'));
     if (!keep) { S.form = null; $('#formSlot').innerHTML = ''; }
     render();
   }
 
-  /* ---------- auth ---------- */
-  async function signIn() {
-    const email = val('signInEmail');
-    $('#signInError').hidden = true;
-    const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } });
-    if (error) {
-      $('#signInError').textContent = /rate limit/i.test(error.message)
-        ? 'Too many sign-in emails were sent in the last hour. Wait a while and try again.'
-        : friendlyError(error);
-      $('#signInError').hidden = false;
-      return;
-    }
-    const sent = $('#signInSent');
-    sent.textContent = `Check your email at ${email} and open the link on this device. You can close this tab.`;
-    sent.hidden = false;
+  $('#switchPerson').addEventListener('click', () => {
+    S.meId = null; S.myHash = null; local.set('me', null); local.set('plannerHash', null);
+    S.form = null; $('#formSlot').innerHTML = ''; $('#tripFormSlot').innerHTML = '';
+    route();
+  });
+
+  /* ---------- backups ---------- */
+  function downloadBackup() {
+    const blob = new Blob([JSON.stringify(D(), null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `trip-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
-  async function join() {
-    $('#joinError').hidden = true;
+  $('#restoreFile').addEventListener('change', async (e) => {
+    const file = e.target.files[0]; e.target.value = '';
+    if (!file) return;
     try {
-      await run(sb.rpc('join_trip', { invite_code: val('joinCode'), name: val('joinName') }));
-      S.loaded = false;
-      await route();
-      toast('Welcome to the trip!');
-    } catch (err) {
-      $('#joinError').textContent = friendlyError(err);
-      $('#joinError').hidden = false;
-    }
-  }
-  $('#signOut').addEventListener('click', async () => { await sb.auth.signOut(); });
+      const doc = JSON.parse(await file.text());
+      if (!validDoc(doc)) { toast('That file isn’t a trip backup.'); return; }
+      if (!doc.plannerHash) doc.plannerHash = D().plannerHash;
+      doc.updated_at = new Date().toISOString();
+      await saveDoc(doc);
+      toast('Backup restored'); route();
+    } catch (err) { fail(err); }
+  });
 
   /* ---------- boot ---------- */
-  function boot() {
-    try { const t = localStorage.getItem('trip.tab'); if (TABS.includes(t)) S.tab = t; } catch { /* storage unavailable */ }
-    const cfg = window.TRIP_CONFIG || {};
-    if (!cfg.supabaseUrl || !cfg.supabaseKey || !window.supabase) {
-      show('setupView'); $('#tripDest').textContent = 'Setup needed.';
-      if (!window.supabase) banner('Couldn’t load the Supabase library. Check your connection and reload.');
+  async function boot() {
+    const t = local.get('tab'); if (TABS.includes(t)) S.tab = t;
+    S.meId = local.get('me'); S.myHash = local.get('plannerHash');
+    if (!STORE) { banner('This site has no storage address set in js/config.js.'); return; }
+    try {
+      const text = await fetchRaw();
+      S.raw = text; S.doc = parseDoc(text);
+      if (!S.doc && text) banner('The trip data looks damaged. A planner can restore a backup from the People tab.');
+    } catch (e) {
+      console.error(e);
+      banner('Can’t reach the trip data. Check your connection and reload the page.');
+      $('#tripDest').textContent = '';
       return;
     }
-    sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey);
-    let first = true;
-    sb.auth.onAuthStateChange((_event, session) => {
-      const uid = session ? session.user.id : null;
-      const changed = first || uid !== S.uid;
-      first = false;
-      S.session = session; S.uid = uid;
-      if (changed) {
-        Object.assign(S, { loaded: false, me: null, codes: null, form: null });
-        if (!session && channel) { sb.removeChannel(channel); channel = null; }
-        // Run outside the auth callback so Supabase calls inside route() don't deadlock.
-        setTimeout(route, 0);
-      }
-    });
-    renderHeader();
+    route();
+    setInterval(refresh, POLL_MS);
+    document.addEventListener('visibilitychange', refresh);
   }
   boot();
 })();

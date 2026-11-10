@@ -1,7 +1,7 @@
-// Your Supabase project's connection details (Dashboard → Project Settings → API).
-// Both values are meant to be public: the database's access rules (supabase/schema.sql)
-// decide what each signed-in person can see and change. Never put the service_role key here.
+// Where the trip's data is stored: one JSON document on textdb.dev (free, no account).
+// Anyone who has this address can read and change the data, and this repository is public,
+// so don't store anything private (passport numbers, phone numbers, home addresses).
+// To start a separate trip, replace the last part with a new random id.
 window.TRIP_CONFIG = {
-  supabaseUrl: '',      // e.g. 'https://abcdefghijklm.supabase.co'
-  supabaseKey: '',      // the "anon public" key (or the newer "publishable" key)
+  storeUrl: 'https://textdb.dev/api/data/group-trip-976c0f26-efc9-4342-986b-1aa9347b2d4c',
 };
