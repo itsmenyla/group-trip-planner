@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Group Trip Planner</title>
+  <meta name="description" content="Plan a group trip together: an itinerary the planning team edits, a suggestion board everyone adds to, and RSVPs for every activity.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="trip">
+      <p class="eyebrow" id="tripDates">Group trip</p>
+      <h1 id="tripName">Group Trip Planner</h1>
+      <p class="dest" id="tripDest">Loading…</p>
+    </div>
+    <div class="who" id="whoChip" hidden>
+      <div><b id="whoName"></b><span id="whoRole"></span></div>
+      <button class="btn small" id="signOut" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" role="status" hidden></div>
+
+  <!-- Not configured yet -->
+  <section class="panel narrow" id="setupView" hidden>
+    <h2>Almost ready</h2>
+    <p>This site isn’t connected to its database yet. Add your Supabase project URL and key to <code>js/config.js</code>, as described in the README.</p>
+  </section>
+
+  <!-- Signed out -->
+  <form class="panel narrow" id="signInView" hidden>
+    <h2>Sign in</h2>
+    <p class="note">Enter your email and we’ll send you a sign-in link. No password needed.</p>
+    <label>Email<input id="signInEmail" type="email" autocomplete="email" required></label>
+    <div class="actions"><button class="btn primary" type="submit">Email me a sign-in link</button></div>
+    <p class="note" id="signInSent" hidden></p>
+    <p class="error" id="signInError" hidden></p>
+  </form>
+
+  <!-- Signed in, not part of the trip yet -->
+  <form class="panel narrow" id="joinView" hidden>
+    <h2>Join the trip</h2>
+    <p class="note">Ask a planner for the invite code. The code decides whether you join the planning team or as a suggester.</p>
+    <label>Your name<input id="joinName" maxlength="40" autocomplete="name" required></label>
+    <label>Invite code<input id="joinCode" autocomplete="off" required></label>
+    <div class="actions"><button class="btn primary" type="submit">Join</button></div>
+    <p class="error" id="joinError" hidden></p>
+  </form>
+
+  <!-- Member view -->
+  <div id="appView" hidden>
+    <div style="display:grid;gap:20px">
+      <div id="tripFormSlot"></div>
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <button role="tab" data-tab="itinerary" aria-selected="true">Itinerary <span class="count" id="cItin"></span></button>
+        <button role="tab" data-tab="suggestions" aria-selected="false">Suggestions <span class="count" id="cSug"></span></button>
+        <button role="tab" data-tab="interest" aria-selected="false">Who’s going</button>
+        <button role="tab" data-tab="people" aria-selected="false">People <span class="count" id="cPeople"></span></button>
+      </nav>
+      <p class="note" id="roleNote"></p>
+      <div id="formSlot"></div>
+      <main id="listSlot"></main>
+    </div>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
