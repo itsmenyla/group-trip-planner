@@ -553,9 +553,28 @@
     try {
       const doc = JSON.parse(await file.text());
       if (!validDoc(doc)) { toast('That file isn’t a trip backup.'); return; }
-      if (!doc.plannerHash) doc.plannerHash = D().plannerHash;
-      doc.updated_at = new Date().toISOString();
-      await saveDoc(doc);
+      S.busy = true;
+      try {
+        // Compare against the latest saved copy, not what this page last saw. If the stored
+        // data is damaged, fall back to this page's copy (restoring is how that gets fixed).
+        const cur = parseDoc(await fetchRaw()) || D() || emptyDoc();
+        const backupIds = new Set(doc.people.map((p) => p.id));
+        const keep = cur.people.filter((p) => !backupIds.has(p.id)); // joined after the backup
+        const when = doc.updated_at ? new Date(doc.updated_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'an unknown date';
+        const n = (k, d) => `${d[k].length} ${k === 'items' ? 'activities' : k === 'sugs' ? 'suggestions' : 'people'}`;
+        const msg = `Replace the current trip (${n('items', cur)}, ${n('sugs', cur)}, ${n('people', cur)}) `
+          + `with the backup from ${when} (${n('items', doc)}, ${n('sugs', doc)}, ${n('people', doc)})?\n\n`
+          + 'Everything changed since that backup will be lost.'
+          + (keep.length ? `\n\n${keep.length === 1 ? 'This person is' : 'These people are'} not in the backup and will be kept: ${keep.map((p) => p.name).join(', ')}.` : '')
+          + '\n\nThe current planner passcode stays the same.';
+        if (!confirm(msg)) return;
+        doc.people.push(...keep);
+        doc.plannerHash = cur.plannerHash || doc.plannerHash; // never bring back an old passcode
+        doc.updated_at = new Date().toISOString();
+        await saveDoc(doc);
+      } finally {
+        S.busy = false;
+      }
       toast('Backup restored'); route();
     } catch (err) { fail(err); }
   });
