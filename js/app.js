@@ -566,9 +566,30 @@
     try {
       const doc = JSON.parse(await file.text());
       if (!validDoc(doc)) { toast('That file isn’t a trip backup.'); return; }
-      if (!doc.plannerHash && D()) doc.plannerHash = D().plannerHash;
-      doc.updated_at = new Date().toISOString();
-      await saveDoc(doc);
+      S.busy = true;
+      try {
+        // Compare against the latest saved copy, not what this page last saw. If the stored
+        // data is damaged, fall back to this page's copy; with neither (the recovery view),
+        // there is nothing to keep and the backup is restored as it is.
+        const cur = parseDoc(await fetchRaw()) || D();
+        const backupIds = new Set(doc.people.map((p) => p.id));
+        const keep = cur ? cur.people.filter((p) => !backupIds.has(p.id)) : []; // joined after the backup
+        const when = doc.updated_at ? new Date(doc.updated_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'an unknown date';
+        const n = (d) => `${d.items.length} activities, ${d.sugs.length} suggestions, ${d.people.length} people`;
+        const msg = cur
+          ? `Replace the current trip (${n(cur)}) with the backup from ${when} (${n(doc)})?\n\n`
+            + 'Everything changed since that backup will be lost.'
+            + (keep.length ? `\n\n${keep.length === 1 ? 'This person is' : 'These people are'} not in the backup and will be kept: ${keep.map((p) => p.name).join(', ')}.` : '')
+            + (cur.plannerHash ? '\n\nThe current planner passcode stays the same.' : '')
+          : `Restore the backup from ${when} (${n(doc)})?\n\nThe stored trip data can’t be read and will be replaced.`;
+        if (!confirm(msg)) return;
+        doc.people.push(...keep);
+        if (cur && cur.plannerHash) doc.plannerHash = cur.plannerHash; // never bring back an old passcode
+        doc.updated_at = new Date().toISOString();
+        await saveDoc(doc);
+      } finally {
+        S.busy = false;
+      }
       toast('Backup restored'); route();
     } catch (err) { fail(err); }
   });
